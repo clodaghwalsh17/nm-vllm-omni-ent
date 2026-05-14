@@ -5,11 +5,17 @@ import importlib
 
 import torch.nn as nn
 from vllm.logger import init_logger
+from vllm.model_executor.model_loader.utils import configure_quant_config
 from vllm.model_executor.models.registry import _LazyRegisteredModel, _ModelRegistry
 
+from vllm_omni.diffusion.config import set_current_diffusion_config
 from vllm_omni.diffusion.data import OmniDiffusionConfig
+from vllm_omni.diffusion.distributed.autoencoders.distributed_vae_executor import DistributedVaeMixin
 from vllm_omni.diffusion.distributed.sp_plan import SequenceParallelConfig, get_sp_plan_from_model
+from vllm_omni.diffusion.forward_context import get_forward_context
 from vllm_omni.diffusion.hooks.sequence_parallel import apply_sequence_parallel
+from vllm_omni.diffusion.utils.tf_utils import find_module_with_attr
+from vllm_omni.platforms import current_omni_platform
 
 logger = init_logger(__name__)
 
@@ -55,6 +61,51 @@ _DIFFUSION_MODELS = {
         "pipeline_wan2_2",
         "Wan22Pipeline",
     ),
+    "WanVACEPipeline": (
+        "wan2_2",
+        "pipeline_wan2_2_vace",
+        "Wan22VACEPipeline",
+    ),
+    "LTX2Pipeline": (
+        "ltx2",
+        "pipeline_ltx2",
+        "LTX2Pipeline",
+    ),
+    "LTX2ImageToVideoPipeline": (
+        "ltx2",
+        "pipeline_ltx2_image2video",
+        "LTX2ImageToVideoPipeline",
+    ),
+    "LTX2TwoStagesPipeline": (
+        "ltx2",
+        "pipeline_ltx2",
+        "LTX2TwoStagesPipeline",
+    ),
+    "LTX2ImageToVideoTwoStagesPipeline": (
+        "ltx2",
+        "pipeline_ltx2_image2video",
+        "LTX2ImageToVideoTwoStagesPipeline",
+    ),
+    "LTX2T2VDMD2Pipeline": (
+        "ltx2",
+        "pipeline_ltx2",
+        "LTX2T2VDMD2Pipeline",
+    ),
+    "LTX2I2VDMD2Pipeline": (
+        "ltx2",
+        "pipeline_ltx2_image2video",
+        "LTX2I2VDMD2Pipeline",
+    ),
+    "LTX23Pipeline": (
+        "ltx2",
+        "pipeline_ltx2_3",
+        "LTX23Pipeline",
+    ),
+    "LTX23ImageToVideoPipeline": (
+        "ltx2",
+        "pipeline_ltx2_3_image2video",
+        "LTX23ImageToVideoPipeline",
+    ),
     "StableAudioPipeline": (
         "stable_audio",
         "pipeline_stable_audio",
@@ -64,6 +115,21 @@ _DIFFUSION_MODELS = {
         "wan2_2",
         "pipeline_wan2_2_i2v",
         "Wan22I2VPipeline",
+    ),
+    "WanS2VPipeline": (
+        "wan2_2",
+        "pipeline_wan2_2_s2v",
+        "Wan22S2VPipeline",
+    ),
+    "WanT2VDMD2Pipeline": (
+        "wan2_2",
+        "pipeline_wan2_2",
+        "WanT2VDMD2Pipeline",
+    ),
+    "WanI2VDMD2Pipeline": (
+        "wan2_2",
+        "pipeline_wan2_2_i2v",
+        "WanI2VDMD2Pipeline",
     ),
     "LongCatImagePipeline": (
         "longcat_image",
@@ -75,6 +141,11 @@ _DIFFUSION_MODELS = {
         "pipeline_bagel",
         "BagelPipeline",
     ),
+    "InternVLAA1Pipeline": (
+        "internvla_a1",
+        "pipeline_internvla_a1",
+        "InternVLAA1Pipeline",
+    ),
     "LongCatImageEditPipeline": (
         "longcat_image",
         "pipeline_longcat_image_edit",
@@ -85,9 +156,14 @@ _DIFFUSION_MODELS = {
         "pipeline_sd3",
         "StableDiffusion3Pipeline",
     ),
+    "FluxKontextPipeline": (
+        "flux",
+        "pipeline_flux_kontext",
+        "FluxKontextPipeline",
+    ),
     "HunyuanImage3ForCausalMM": (
-        "hunyuan_image_3",
-        "pipeline_hunyuan_image_3",
+        "hunyuan_image3",
+        "pipeline_hunyuan_image3",
         "HunyuanImage3Pipeline",
     ),
     "Flux2KleinPipeline": (
@@ -95,10 +171,95 @@ _DIFFUSION_MODELS = {
         "pipeline_flux2_klein",
         "Flux2KleinPipeline",
     ),
+    "ErnieImagePipeline": (
+        "ernie_image",
+        "pipeline_ernie_image",
+        "ErnieImagePipeline",
+    ),
+    "NextStep11Pipeline": (
+        "nextstep_1_1",
+        "pipeline_nextstep_1_1",
+        "NextStep11Pipeline",
+    ),
     "FluxPipeline": (
         "flux",
         "pipeline_flux",
         "FluxPipeline",
+    ),
+    "FluxDMD2Pipeline": (
+        "flux",
+        "pipeline_flux",
+        "FluxDMD2Pipeline",
+    ),
+    "QwenImageDMD2Pipeline": (
+        "qwen_image",
+        "pipeline_qwen_image",
+        "QwenImageDMD2Pipeline",
+    ),
+    "OmniGen2Pipeline": (
+        "omnigen2",
+        "pipeline_omnigen2",
+        "OmniGen2Pipeline",
+    ),
+    "HeliosPipeline": (
+        "helios",
+        "pipeline_helios",
+        "HeliosPipeline",
+    ),
+    "HeliosPyramidPipeline": (
+        "helios",
+        "pipeline_helios",
+        "HeliosPipeline",
+    ),
+    "Flux2Pipeline": (
+        "flux2",
+        "pipeline_flux2",
+        "Flux2Pipeline",
+    ),
+    "DreamIDOmniPipeline": (
+        "dreamid_omni",
+        "pipeline_dreamid_omni",
+        "DreamIDOmniPipeline",
+    ),
+    "SenseNovaU1Pipeline": (
+        "sensenova_u1",
+        "pipeline_sensenova_u1",
+        "SenseNovaU1Pipeline",
+    ),
+    "AudioXPipeline": (
+        "audiox",
+        "pipeline_audiox",
+        "AudioXPipeline",
+    ),
+    "HunyuanVideo15Pipeline": (
+        "hunyuan_video",
+        "pipeline_hunyuan_video_1_5",
+        "HunyuanVideo15Pipeline",
+    ),
+    "HunyuanVideo15ImageToVideoPipeline": (
+        "hunyuan_video",
+        "pipeline_hunyuan_video_1_5_i2v",
+        "HunyuanVideo15I2VPipeline",
+    ),
+    "MagiHumanPipeline": (
+        "magi_human",
+        "pipeline_magi_human",
+        "MagiHumanPipeline",
+    ),
+    "OmniVoicePipeline": (
+        "omnivoice",
+        "pipeline_omnivoice",
+        "OmniVoicePipeline",
+    ),
+    "OmniVoice": (
+        "omnivoice",
+        "pipeline_omnivoice",
+        "OmniVoicePipeline",
+    ),
+    "DiffusersAdapterPipeline": (
+        "diffusers_adapter",
+        "pipeline_diffusers_adapter",
+        "DiffusersAdapterPipeline",
     ),
 }
 
@@ -113,10 +274,28 @@ DiffusionModelRegistry = _ModelRegistry(
     }
 )
 
-_VAE_PATCH_PARALLEL_ALLOWLIST = {
-    # Only enable for models we have validated end-to-end.
-    "ZImagePipeline",
+_NO_CACHE_ACCELERATION = {
+    # Pipelines that do not support cache acceleration (cache_dit / tea_cache).
+    "NextStep11Pipeline",
+    "SenseNovaU1Pipeline",
+    "AudioXPipeline",
 }
+
+
+def _prepare_diffusion_quant_config(
+    od_config: OmniDiffusionConfig,
+    model_class: type[nn.Module],
+) -> None:
+    """Prepare diffusion quant config using vLLM-style model bindings."""
+    quant_config = getattr(od_config, "quantization_config", None)
+    if quant_config is None:
+        return
+    if hasattr(quant_config, "maybe_update_config"):
+        quant_config.maybe_update_config(od_config.model)
+    diffusion_packed_modules_mapping = current_omni_platform.get_diffusion_packed_modules_mapping(model_class)
+    if diffusion_packed_modules_mapping is not None:
+        model_class.packed_modules_mapping = diffusion_packed_modules_mapping
+    configure_quant_config(quant_config, model_class)
 
 
 def initialize_model(
@@ -141,20 +320,19 @@ def initialize_model(
     """
     model_class = DiffusionModelRegistry._try_load_model_cls(od_config.model_class_name)
     if model_class is not None:
-        model = model_class(od_config=od_config)
+        _prepare_diffusion_quant_config(od_config, model_class)
+        with set_current_diffusion_config(od_config):
+            model = model_class(od_config=od_config)
 
         vae_pp_size = od_config.parallel_config.vae_patch_parallel_size
-        if vae_pp_size > 1 and od_config.model_class_name not in _VAE_PATCH_PARALLEL_ALLOWLIST:
+        is_distributed_vae = hasattr(model, "vae") and isinstance(model.vae, DistributedVaeMixin)
+        if vae_pp_size > 1 and not is_distributed_vae:
             logger.warning(
-                "vae_patch_parallel_size=%d is set but VAE patch parallelism is only enabled for %s; ignoring.",
+                "vae_patch_parallel_size=%d is set but VAE patch parallelism is NOT enabled for %s; ignoring.",
                 vae_pp_size,
-                sorted(_VAE_PATCH_PARALLEL_ALLOWLIST),
+                od_config.model_class_name,
             )
-        if (
-            vae_pp_size > 1
-            and od_config.model_class_name in _VAE_PATCH_PARALLEL_ALLOWLIST
-            and not od_config.vae_use_tiling
-        ):
+        if vae_pp_size > 1 and is_distributed_vae and not od_config.vae_use_tiling:
             logger.info(
                 "vae_patch_parallel_size=%d requires vae_use_tiling; automatically enabling it.",
                 vae_pp_size,
@@ -162,25 +340,13 @@ def initialize_model(
             od_config.vae_use_tiling = True
 
         # Configure VAE memory optimization settings from config
-        if hasattr(model.vae, "use_slicing"):
+        if hasattr(model, "vae") and hasattr(model.vae, "use_slicing"):
             model.vae.use_slicing = od_config.vae_use_slicing
-        if hasattr(model.vae, "use_tiling"):
+        if hasattr(model, "vae") and hasattr(model.vae, "use_tiling"):
             model.vae.use_tiling = od_config.vae_use_tiling
 
-        if (
-            vae_pp_size > 1
-            and hasattr(model, "vae")
-            and od_config.model_class_name in _VAE_PATCH_PARALLEL_ALLOWLIST
-            and od_config.vae_use_tiling
-        ):
-            from vllm_omni.diffusion.distributed.parallel_state import get_dit_group
-            from vllm_omni.diffusion.distributed.vae_patch_parallel import maybe_wrap_vae_decode_with_patch_parallelism
-
-            maybe_wrap_vae_decode_with_patch_parallelism(
-                model,
-                vae_patch_parallel_size=vae_pp_size,
-                group_getter=get_dit_group,
-            )
+        if is_distributed_vae:
+            model.vae.set_parallel_size(vae_pp_size)
 
         # Apply sequence parallelism if enabled
         # This follows diffusers' pattern where enable_parallelism() is called
@@ -219,7 +385,12 @@ def _apply_sequence_parallel_if_enabled(model, od_config: OmniDiffusionConfig) -
 
         for attr in transformer_attrs:
             if not hasattr(model, attr):
-                continue
+                # Some pipeline like LTX2TwoStagesPipeline have recursive
+                # modules that have the transformer
+                module = find_module_with_attr(model, attr)
+                if module is None:
+                    continue
+                model = module
 
             transformer = getattr(model, attr)
             if transformer is None:
@@ -248,6 +419,11 @@ def _apply_sequence_parallel_if_enabled(model, od_config: OmniDiffusionConfig) -
             apply_sequence_parallel(transformer, sp_config, plan)
             applied_count += 1
 
+        # update forward context sp_plan_hooks_applied
+        ctx = get_forward_context()
+        ctx.sp_plan_hooks_applied = applied_count > 0
+        logger.debug(f"Setting sp_plan_hooks_applied={ctx.sp_plan_hooks_applied} in ``ForwardContext``!")
+
         if applied_count == 0:
             logger.warning(
                 f"Sequence parallelism is enabled (sp_size={sp_size}) but no transformer with _sp_plan found. "
@@ -269,14 +445,43 @@ _DIFFUSION_POST_PROCESS_FUNCS = {
     "ZImagePipeline": "get_post_process_func",
     "OvisImagePipeline": "get_ovis_image_post_process_func",
     "WanPipeline": "get_wan22_post_process_func",
+    "WanVACEPipeline": "get_wan22_vace_post_process_func",
+    "LTX2Pipeline": "get_ltx2_post_process_func",
+    "LTX2TwoStagesPipeline": "get_ltx2_post_process_func",
+    "LTX2ImageToVideoPipeline": "get_ltx2_post_process_func",
+    "LTX2ImageToVideoTwoStagesPipeline": "get_ltx2_post_process_func",
+    "LTX2T2VDMD2Pipeline": "get_ltx2_post_process_func",
+    "LTX2I2VDMD2Pipeline": "get_ltx2_post_process_func",
+    "LTX23Pipeline": "get_ltx2_post_process_func",
+    "LTX23ImageToVideoPipeline": "get_ltx2_post_process_func",
     "StableAudioPipeline": "get_stable_audio_post_process_func",
+    "AudioXPipeline": "get_audiox_post_process_func",
     "WanImageToVideoPipeline": "get_wan22_i2v_post_process_func",
+    "WanS2VPipeline": "get_wan22_s2v_post_process_func",
+    "WanT2VDMD2Pipeline": "get_wan22_post_process_func",
+    "WanI2VDMD2Pipeline": "get_wan22_i2v_post_process_func",
     "LongCatImagePipeline": "get_longcat_image_post_process_func",
     "BagelPipeline": "get_bagel_post_process_func",
+    "InternVLAA1Pipeline": "get_internvla_a1_post_process_func",
     "LongCatImageEditPipeline": "get_longcat_image_post_process_func",
     "StableDiffusion3Pipeline": "get_sd3_image_post_process_func",
+    "FluxKontextPipeline": "get_flux_kontext_post_process_func",
     "Flux2KleinPipeline": "get_flux2_klein_post_process_func",
+    "ErnieImagePipeline": "get_ernie_image_post_process_func",
+    "NextStep11Pipeline": "get_nextstep11_post_process_func",
     "FluxPipeline": "get_flux_post_process_func",
+    "FluxDMD2Pipeline": "get_flux_post_process_func",
+    "QwenImageDMD2Pipeline": "get_qwen_image_post_process_func",
+    "OmniGen2Pipeline": "get_omnigen2_post_process_func",
+    "HeliosPipeline": "get_helios_post_process_func",
+    "HeliosPyramidPipeline": "get_helios_post_process_func",
+    "Flux2Pipeline": "get_flux2_post_process_func",
+    "HunyuanVideo15Pipeline": "get_hunyuan_video_15_post_process_func",
+    "HunyuanVideo15ImageToVideoPipeline": "get_hunyuan_video_15_i2v_post_process_func",
+    "MagiHumanPipeline": "get_magi_human_post_process_func",
+    "OmniVoicePipeline": "get_omnivoice_post_process_func",
+    "DreamIDOmniPipeline": "get_dreamid_omni_post_process_func",
+    "SenseNovaU1Pipeline": "get_sensenova_u1_post_process_func",
 }
 
 _DIFFUSION_PRE_PROCESS_FUNCS = {
@@ -289,14 +494,79 @@ _DIFFUSION_PRE_PROCESS_FUNCS = {
     "LongCatImageEditPipeline": "get_longcat_image_edit_pre_process_func",
     "QwenImageLayeredPipeline": "get_qwen_image_layered_pre_process_func",
     "WanPipeline": "get_wan22_pre_process_func",
+    "WanVACEPipeline": "get_wan22_vace_pre_process_func",
     "WanImageToVideoPipeline": "get_wan22_i2v_pre_process_func",
+    "WanS2VPipeline": "get_wan22_s2v_pre_process_func",
+    "WanT2VDMD2Pipeline": "get_wan22_pre_process_func",
+    "WanI2VDMD2Pipeline": "get_wan22_i2v_pre_process_func",
+    "OmniGen2Pipeline": "get_omnigen2_pre_process_func",
+    "HeliosPipeline": "get_helios_pre_process_func",
+    "HeliosPyramidPipeline": "get_helios_pre_process_func",
+    "HunyuanVideo15ImageToVideoPipeline": "get_hunyuan_video_15_i2v_pre_process_func",
+    "HunyuanImage3ForCausalMM": "get_hunyuan_image_3_pre_process_func",
+    "MagiHumanPipeline": "get_magi_human_pre_process_func",
 }
+
+
+def register_diffusion_model(
+    model_arch: str,
+    module_name: str,
+    class_name: str,
+    pre_process_func_name: str | None = None,
+    post_process_func_name: str | None = None,
+) -> None:
+    """Register a diffusion model pipeline from an out-of-tree plugin.
+
+    This can be used to add new model architectures or to replace an
+    existing built-in pipeline with a platform-optimised implementation
+    (same ``model_arch`` key).
+
+    Args:
+        model_arch: Architecture name (e.g. ``"WanPipeline"``).
+        module_name: Fully qualified module path
+            (e.g. ``"my_plugin.diffusion.pipeline_wan"``).
+        class_name: Class name within *module_name*.
+        pre_process_func_name: Optional name of the pre-process function
+            located in *module_name*.  Pass ``None`` to keep the existing
+            entry when replacing a built-in model.
+        post_process_func_name: Optional name of the post-process function
+            located in *module_name*.  Pass ``None`` to keep the existing
+            entry when replacing a built-in model.
+    """
+    # Register model class in DiffusionModelRegistry
+    DiffusionModelRegistry.register_model(
+        model_arch,
+        f"{module_name}:{class_name}",
+    )
+
+    # Store in _DIFFUSION_MODELS so _load_process_func can resolve the
+    # module.  Convention: when mod_relname is empty the mod_folder field
+    # stores a *full* module path instead of a relative folder.
+    _DIFFUSION_MODELS[model_arch] = (module_name, "", class_name)
+
+    # Optionally register pre/post process funcs.
+    if pre_process_func_name is not None:
+        _DIFFUSION_PRE_PROCESS_FUNCS[model_arch] = pre_process_func_name
+    if post_process_func_name is not None:
+        _DIFFUSION_POST_PROCESS_FUNCS[model_arch] = post_process_func_name
+
+    logger.info(
+        "Registered diffusion model %s -> %s.%s",
+        model_arch,
+        module_name,
+        class_name,
+    )
 
 
 def _load_process_func(od_config: OmniDiffusionConfig, func_name: str):
     """Load and return a process function from the appropriate module."""
     mod_folder, mod_relname, _ = _DIFFUSION_MODELS[od_config.model_class_name]
-    module_name = f"vllm_omni.diffusion.models.{mod_folder}.{mod_relname}"
+    if mod_relname == "":
+        # Full module path (registered via register_diffusion_model)
+        module_name = mod_folder
+    else:
+        # Built-in model (relative path convention)
+        module_name = f"vllm_omni.diffusion.models.{mod_folder}.{mod_relname}"
     module = importlib.import_module(module_name)
     func = getattr(module, func_name)
     return func(od_config)

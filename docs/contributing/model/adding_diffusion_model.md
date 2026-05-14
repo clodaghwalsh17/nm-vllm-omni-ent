@@ -1,4 +1,4 @@
-# Adding a Diffusion Model to vLLM-Omni
+# Adding a Diffusion Model
 
 This guide walks you through adding a new diffusion model to vLLM-Omni. We use **Qwen-Image** as the primary example, with references to other models (LongCat, Flux, Wan2.2) to illustrate different patterns.
 
@@ -115,17 +115,20 @@ class YourAttentionBlock(nn.Module):
 from vllm_omni.diffusion.attention.layer import Attention
 from vllm_omni.diffusion.attention.backends.abstract import AttentionMetadata
 
-class YourAttentionBlock(nn.Module):
+class YourSelfAttentionBlock(nn.Module):
     def __init__(self, ...):
         super().__init__()
 
-        # Initialize vLLM-Omni's Attention layer
+        # Initialize vLLM-Omni's Attention layer.
+        # `role` lets users target this site with --diffusion-attention-config
+        # (e.g. --diffusion-attention-config.per_role.self.backend SAGE_ATTN).
         self.attn = Attention(
             num_heads=self.num_heads,
             head_size=self.head_dim,
             softmax_scale=1.0 / (self.head_dim ** 0.5),
             causal=False,  # Diffusion models typically use bidirectional attention
             num_kv_heads=self.num_kv_heads,
+            role="self",
         )
 
     def forward(self, hidden_states, encoder_hidden_states=None, attention_mask=None, ...):
@@ -133,7 +136,6 @@ class YourAttentionBlock(nn.Module):
         # Create attention metadata
         attn_metadata = AttentionMetadata(attn_mask=attention_mask)
         hidden_states = self.attn(query, key, value, attn_metadata=attn_metadata)
-
 ```
 
 **Key Points:**
@@ -141,8 +143,35 @@ class YourAttentionBlock(nn.Module):
 - **Attention layer initialization:** Done in `__init__`, not per-forward
 - **Tensor shapes:** vLLM-Omni `Attention` expects QKV to have `[B, seq, num_heads, head_dim]` shape
 - **AttentionMetadata:** Wraps attention mask and other metadata
+- **Role:** Tag every `Attention` site with a `role` string so users can configure backends per role (see below)
 
-**Attention backends:** vLLM-Omni automatically selects the attention backend given the environmental variable `DIFFUSION_ATTENTION_BACKEND`. The default attention backend is `FLASH_ATTN` for diffusion models.
+**Declaring attention roles**
+
+The `role` argument is a free-form string that identifies this attention site. Users can match it from `--diffusion-attention-config.per_role.<role>.*` to swap backends without touching model code. Two conventions cover the common cases:
+
+| Convention | When to use | Example |
+|---|---|---|
+| `"self"` | Q/K/V come from the same hidden state | DiT self-attention block |
+| `"cross"` | K/V come from a separate `encoder_hidden_states` | Text-conditioned cross-attention |
+
+For multi-modal or unusual sites, use a dot-namespaced role and pair it with `role_category` so it can fall back to the generic config when nothing model-specific is set:
+
+```python
+# A model-specific cross-attention site that user config can target
+# either as 'mymodel.audio_to_video' (exact) or as 'cross' (category fallback).
+self.audio_to_video_attn = Attention(
+    num_heads=self.num_heads,
+    head_size=self.head_dim,
+    softmax_scale=1.0 / (self.head_dim ** 0.5),
+    causal=False,
+    role="mymodel.audio_to_video",
+    role_category="cross",
+)
+```
+
+For cross-attention sites whose K/V are replicated across ranks (e.g. text encoder output), pass `skip_sequence_parallel=True` to opt this layer out of sequence-parallel sharding.
+
+**Attention backends:** When the user does not configure a backend, vLLM-Omni asks the current platform for its default (typically `FLASH_ATTN` on CUDA when available). Users override the default via `--diffusion-attention-backend`, the `DIFFUSION_ATTENTION_BACKEND` env var, or finer-grained `--diffusion-attention-config.per_role.*` flags. See [Diffusion Attention Backends](../../user_guide/diffusion/attention_backends.md) for the full configuration surface.
 
 #### 1.3: Replace Imports and Utilities
 
@@ -651,8 +680,9 @@ For a fair comparison, keep the same **prompt**, **seed**, **resolution**, **num
 
 #### 5.2 Functionality Check in CI
 
-To ensure project maintainability and sustainable development, we encourage contributors to submit test code (unit tests, system tests, or end-to-end tests) alongside their code changes.
-For comprehensive testing guidelines, please refer to the [Test File Structure and Style Guide](../ci/tests_style.md).
+To ensure project maintainability and sustainable development, please submit test code (unit tests, system tests, or end-to-end tests) alongside their code changes.
+
+For comprehensive testing guidelines and the definition of test levels (L1-L5), please refer to the [Multi-Level Automated Testing System Documentation](../ci/CI_5levels.md). You are at least required to add an L4 *functionality* test described in that document.
 
 ---
 
@@ -680,7 +710,7 @@ vLLM-Omni automatically compiles blocks in `_repeated_blocks` when `torch.compil
 
 ### Tensor Parallelism
 
-See detailed guide: [How to add Tensor Parallel support](../features/tensor_parallel.md)
+See detailed guide: [How to add Tensor Parallel support](../../design/feature/tensor_parallel.md)
 
 **Quick setup:**
 
@@ -694,7 +724,7 @@ omni = Omni(model="your-model", tensor_parallel_size=2)
 
 ### CFG Parallelism
 
-See detailed guide: [How to add CFG-Parallel support](../features/cfg_parallel.md)
+See detailed guide: [How to add CFG-Parallel support](../../design/feature/cfg_parallel.md)
 
 **Quick setup:**
 
@@ -708,7 +738,7 @@ omni = Omni(model="your-model", cfg_parallel_size=2)
 
 ### Sequence Parallelism
 
-See detailed guide: [How to add Sequence Parallel support](../features/sequence_parallel.md)
+See detailed guide: [How to add Sequence Parallel support](../../design/feature/sequence_parallel.md)
 
 **Quick setup:**
 
@@ -720,11 +750,37 @@ See detailed guide: [How to add Sequence Parallel support](../features/sequence_
 omni = Omni(model="your-model", ulysses_degree=2, ring_degree=2)
 ```
 
+### Step Execution
+
+See detailed design guide: [How to add step execution support](../../design/feature/diffusion_step_execution.md)
+
+Use this only when your pipeline can be split into stable request-scoped and
+step-scoped phases. The reference implementation is
+`QwenImagePipeline`, which maps its request-level `forward()` into:
+
+1. `prepare_encode()` for prompt encoding, latent init, timestep prep, and per-request scheduler setup.
+2. `denoise_step()` for one transformer/noise prediction.
+3. `step_scheduler()` for one scheduler update and `step_index` advance.
+4. `post_decode()` for the final VAE decode.
+
+Do not enable `step_execution=True` until those four methods are implemented
+and validated against the request-level path.
+
+If you want the pipeline to work with the experimental batched step-wise path
+(`max_num_seqs > 1`), also see:
+[Continuous Batching for Step-Wise Diffusion](../../design/feature/diffusion_continuous_batching.md).
+
+If you expose this in example scripts or recipes, keep it opt-in. Surface
+runtime features like `step_execution` as optional flags instead of silently
+turning them on. For Qwen-Image-style serving examples, document
+`--step-execution` as the feature gate and `--max-num-seqs N` as the
+companion batching knob.
+
 ### Cache Acceleration
 
 #### TeaCache
 
-See detailed guide: [How to add TeaCache support](../features/teacache.md)
+See detailed guide: [How to add TeaCache support](../../design/feature/teacache.md)
 
 **Quick setup:**
 
@@ -744,7 +800,7 @@ omni = Omni(model="your-model",
 
 #### Cache-DiT
 
-See detailed guide: [How to add Cache-DiT support](../features/cache_dit.md)
+See detailed guide: [How to add Cache-DiT support](../../design/feature/cache_dit.md)
 
 **Quick setup:**
 
@@ -785,7 +841,7 @@ omni = Omni(model="your-model", enable_layerwise_offload=True)
 
 ```python
 class WanTransformer3DModel(nn.Module):
-    _layerwise_offload_blocks_attr = "blocks"  # Attribute name containing transformer blocks
+    _layerwise_offload_blocks_attrs = ["blocks"]  # Attribute name containing transformer blocks
 
     def __init__(self):
         self.blocks = nn.ModuleList([...])  # Transformer blocks
@@ -795,6 +851,109 @@ class WanTransformer3DModel(nn.Module):
 
 
 ---
+
+### Diffusion Pipeline Profiler (Performance Profiling)
+When adapting a new diffusion model, it is often useful to analyze the latency of key components such as text encoding, diffusion denoising, and VAE decoding.
+vLLM-Omni provides a timing utility via `DiffusionPipelineProfilerMixin` to help developers quickly identify performance bottlenecks.
+
+!!! info
+      `DiffusionPipelineProfilerMixin` is different from using `torch.profiler` for diffusion models, as introduced in this [tutorial](https://github.com/vllm-project/vllm-omni/blob/main/docs/contributing/profiling.md). `DiffusionPipelineProfilerMixin` only prints the timing information of multiple functions (such as `vae.decode`), while `torch.profiler` saves detailed GPU/CPU computation time, call/execution steps.
+
+This tool automatically measures the execution time of selected pipeline modules and prints the results in the logs.
+
+**Enabling Diffusion Pipeline Profiler**
+
+
+Enable timing by setting:
+```
+vllm serve Qwen/Qwen-Image --omni --port 8091 --enable-diffusion-pipeline-profiler
+```
+You can optionally specify which modules to profile:
+```
+class YourPipeline(xxx, DiffusionPipelineProfilerMixin):
+    def __init__(self, xxx):
+        ...
+        self.setup_diffusion_pipeline_profiler(profiler_targets=["diffuse"], enable_diffusion_pipeline_profiler)
+```
+If not specified, the default targets are used:
+```
+["vae.encode", "vae.decode", "diffuse", "text_encoder.forward", "tokenizer.forward"]
+```
+**Adding DiffusionPipelineProfilerMixin to a Pipeline**
+To enable timing support in your pipeline, inherit from DiffusionPipelineProfilerMixin.
+```python
+from vllm_omni.diffusion.profiler import DiffusionPipelineProfilerMixin
+
+class YourModelPipeline(nn.Module, DiffusionPipelineProfilerMixin):
+    # Optional: Specify custom timing targets
+    _PROFILER_TARGETS = ["vae.encode", "vae.decode", "diffuse", "text_encoder.forward", "tokenizer.forward"]
+
+    def __init__(
+        self,
+        *,
+        od_config: OmniDiffusionConfig,
+        prefix: str = "",
+    ):
+        super().__init__()
+        self.od_config = od_config
+        self.parallel_config = od_config.parallel_config
+        # initialize pipeline components
+        ...
+
+        # initialize timing profiler
+        self.setup_diffusion_pipeline_profiler(
+            enable_diffusion_pipeline_profiler=self.od_config.enable_diffusion_pipeline_profiler
+        )
+```
+The mixin dynamically wraps selected methods and records their execution time during inference.
+
+If you need to fetch the execution time of different modules, you will need to pass `self.stage_durations` to `DiffusionOutput`, as shown below:
+
+```diff
+-   return DiffusionOutput(output=img)
++   return DiffusionOutput(
+            output=image, stage_durations=self.stage_durations if hasattr(self, "stage_durations") else None
+        )
+```
+
+**Pipeline Design for Timing**
+The current diffusion timing utility is function-based, meaning it measures the execution time of individual methods.
+
+When implementing a new pipeline, avoid putting all logic inside a single function (e.g., forward). Instead, structure the pipeline in a modular way by separating key stages into independent methods, such as the diffusion loop.
+
+For example:
+```
+def forward(self, req: OmniDiffusionRequest):
+    prompt_embeds = self.encode_prompt(req)
+    latents = self.diffuse(prompt_embeds, req)
+    images = self.vae.decode(latents)
+    return DiffusionOutput(output=images)
+```
+This allows the timing utility to measure each stage (e.g., encode_prompt, diffuse, vae.decode) separately and helps identify performance bottlenecks more easily.
+
+
+**Default Profiled Modules**
+
+By default, the following pipeline modules are timed:
+```
+vae.encode
+vae.decode
+diffuse
+text_encoder.forward
+tokenizer.forward
+```
+
+**Example Output**
+
+When enabled, timing logs appear like this:
+```
+[DiffusionPipelineProfiler] text_encoder.forward took 0.018s
+[DiffusionPipelineProfiler] diffuse took 2.412s
+[DiffusionPipelineProfiler] vae.decode took 0.063s
+```
+These measurements help identify bottlenecks during model adaptation and optimization
+
+
 
 ## Troubleshooting
 
@@ -847,7 +1006,7 @@ hidden_states = hidden_states.reshape(batch_size, seq_len, -1)
 
 1. **Reduce batch size:**
    ```python
-   omni.generate(prompts=[...], max_batch_size=2)
+   omni.generate(prompts=[...], max_num_seqs=2)
    ```
 
 2. **Use smaller image size:**

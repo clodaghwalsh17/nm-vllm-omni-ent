@@ -1,31 +1,21 @@
 from collections.abc import Iterable
-from typing import Any
 
 import torch
 import torch.nn as nn
 from transformers.models.qwen3_omni_moe.configuration_qwen3_omni_moe import (
     Qwen3OmniMoeTalkerConfig,
 )
-from transformers.models.qwen3_omni_moe.modeling_qwen3_omni_moe import (
-    Qwen3OmniMoeAudioEncoder,
-)
 from vllm.config import VllmConfig
 from vllm.logger import init_logger
 from vllm.model_executor.layers.activation import _ACTIVATION_REGISTRY
 from vllm.model_executor.models.interfaces import (
-    MultiModalEmbeddings,
     SupportsPP,
 )
-from vllm.model_executor.models.qwen2_5_omni_thinker import (
-    Qwen2_5OmniThinkerDummyInputsBuilder,
-)
-from vllm.model_executor.models.qwen3_omni_moe_thinker import Qwen3Omni_VisionTransformer
 from vllm.model_executor.models.utils import (
     AutoWeightsLoader,
     WeightsMapper,
     maybe_prefix,
 )
-from vllm.multimodal import MULTIMODAL_REGISTRY
 from vllm.sequence import IntermediateTensors
 
 from vllm_omni.model_executor.models.qwen3_omni.qwen3_omni_moe_code_predictor_mtp import (
@@ -33,32 +23,15 @@ from vllm_omni.model_executor.models.qwen3_omni.qwen3_omni_moe_code_predictor_mt
 )
 from vllm_omni.model_executor.models.qwen3_omni.qwen3_omni_moe_thinker import (
     Qwen3MoeLLMForCausalLM,
-    Qwen3OmniMoeConditionalGenerationMixin,
-    Qwen3OmniMoeThinkerMultiModalProcessor,
-    Qwen3OmniMoeThinkerProcessingInfo,
 )
-
-try:
-    import flash_attn
-except (ImportError, ModuleNotFoundError):
-    flash_attn = None
-
+from vllm_omni.quantization.component_config import ComponentQuantizationConfig
 
 logger = init_logger(__name__)
 
-Qwen3OmniMoeThinkerDummyInputsBuilder = Qwen2_5OmniThinkerDummyInputsBuilder
 
-
-@MULTIMODAL_REGISTRY.register_processor(
-    Qwen3OmniMoeThinkerMultiModalProcessor,
-    info=Qwen3OmniMoeThinkerProcessingInfo,
-    dummy_inputs=Qwen3OmniMoeThinkerDummyInputsBuilder,
-)
 class Qwen3OmniMoeTalkerForConditionalGeneration(
     nn.Module,
-    # SupportsMultiModal,
     SupportsPP,
-    Qwen3OmniMoeConditionalGenerationMixin,
 ):
     """
     Qwen3 Omni MoE Talker - Converts text to audio codec codes.
@@ -99,9 +72,28 @@ class Qwen3OmniMoeTalkerForConditionalGeneration(
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
         super().__init__()
         talker_config: Qwen3OmniMoeTalkerConfig = vllm_config.model_config.hf_config
-        talker_config.text_config.rope_parameters = talker_config.text_config.rope_scaling
-        talker_config.text_config.rope_parameters["rope_theta"] = talker_config.text_config.rope_theta
-        self.quant_config = vllm_config.quant_config
+        rope_params = getattr(talker_config.text_config, "rope_scaling", None)
+        if rope_params is None:
+            rope_params = getattr(talker_config.text_config, "rope_parameters", None) or {}
+        rope_params = dict(rope_params)
+        # In transformers <5.0.0, rope_theta is a top-level config attribute
+        # (e.g. config.text_config.rope_theta = 1000000.0).
+        # In transformers >=5.0.0 (PR #39847), rope_theta moved inside the
+        # rope_parameters dict (e.g. config.text_config.rope_parameters =
+        # {"rope_theta": 1000000.0, "rope_type": "default"}).
+        # Use setdefault so we never overwrite a value already present.
+        # Precedence: rope_params["rope_theta"] (already set)
+        #           > text_config.rope_theta (transformers <5.0.0 top-level attr)
+        #           > 1000000 (Qwen3 Omni default)
+        rope_params.setdefault(
+            "rope_theta",
+            getattr(talker_config.text_config, "rope_theta", 1000000),
+        )
+        talker_config.text_config.rope_parameters = rope_params
+        quant_config = vllm_config.quant_config
+        if isinstance(quant_config, ComponentQuantizationConfig):
+            quant_config = quant_config.resolve("talker")
+        self.quant_config = quant_config
         self.prefix = prefix
         self.vllm_config = vllm_config
         self.config = talker_config
@@ -129,138 +121,72 @@ class Qwen3OmniMoeTalkerForConditionalGeneration(
         self.code_predictor = Qwen3OmniMoeTalkerCodePredictor(
             vllm_config=vllm_config, prefix=maybe_prefix(prefix, "code_predictor")
         )
-        max_batch_size = max(
-            vllm_config.scheduler_config.max_num_seqs, vllm_config.compilation_config.max_cudagraph_capture_size
-        )
-        self.layer0_embed_buffer = torch.zeros(
-            (max_batch_size, 1, self.config.text_config.hidden_size),
-            dtype=vllm_config.model_config.dtype,
-        )
 
     def code_predictor_forward(
         self,
         input_ids: torch.Tensor,
         inputs_embeds: torch.Tensor | None = None,
         *,
-        temperature: float = 1.0,
-        top_k: int = 50,  # Match transformers default
-        top_p: float = 0.8,  # Match transformers default
-        generation_steps: int | None = None,
         last_talker_hidden: torch.Tensor | None = None,
         **_: object,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        """
-        Generate full RVQ codec codes for the provided sequence.
+        """Generate full RVQ codes + summed embeddings (single-loop, no KV cache).
 
-        The code predictor consumes the layer-0 codec codes produced by the talker
-        alongside the talker's hidden states, and autoregressively predicts the remaining
-        residual layers (to num_codec_groups).
+        The code predictor uses re-prefill: each AR step re-forwards the full
+        (short) sequence through the transformer. The returned ``proj_buf``
+        already contains all codec embeddings at positions 1..G,
+        so summed_embeddings = proj_buf[:, 1:, :].sum(dim=1)  — no second
+        loop or re-embedding needed.
 
         Returns:
-            tuple containing:
-                - residual_codes: A tensor of shape [batch, num_code_groups, seq_len] containing
-                  the complete set of codec codes
-                - summed_embeddings: A tensor of shape [batch, seq_len, hidden_size]
-                  Sum of all layer embeddings at each position (like Transformers)
+            result_codes:      [batch, num_code_groups, seq_len]
+            summed_embeddings: [batch, seq_len, hidden_size]
         """
         if input_ids is None:
-            raise ValueError("`input_ids` containing layer-0 codec codes must be provided.")
+            raise ValueError("`input_ids` (layer-0 codes) must be provided.")
         if inputs_embeds is None:
-            raise ValueError("`inputs_embeds` containing talker hidden states must be provided.")
+            raise ValueError("`inputs_embeds` (talker hidden states) must be provided.")
 
         if inputs_embeds.ndim == 2:
             inputs_embeds = inputs_embeds.unsqueeze(0)
         if input_ids.ndim == 1:
             input_ids = input_ids.unsqueeze(0)
 
-        # Ensure the tensors are contiguous for the autoregressive sampling loop
-        inputs_embeds = inputs_embeds.contiguous()
-        input_ids = input_ids.contiguous()
-
-        # Generate full codec codes using MTP
-        # This will be the parallel prediction implementation
         batch_size, seq_len = input_ids.shape
+        device = input_ids.device
+        embed_fn = self.language_model.model.codec_embedding
+        hidden_size = self.config.code_predictor_config.hidden_size
 
-        # For now, use sequential generation (TODO: implement parallel)
-        # Result will be [batch, num_code_groups, seq_len]
-        # - all_codes_per_position will collect [batch, num_code_groups, 1] for each position
-        all_codes_per_position = []
-        middle_hidden_states = []  # Collect hidden states for each position
-
-        # Generate residual layers for each position
-        for pos in range(seq_len):
-            layer0_code = input_ids[:, pos : pos + 1]  # [batch, 1]
-
-            # Initial input: [last_talker_hidden, layer0_embed]
-            layer0_embed = self.embed_input_ids(layer0_code)
-            self.layer0_embed_buffer[:batch_size].copy_(layer0_embed)
-            pos_all_layers, current_input = self.code_predictor(
-                layer0_code, self.layer0_embed_buffer[:batch_size], last_talker_hidden
-            )
-
-            # Stack all layers for this position: [batch, num_code_groups, 1]
-            all_codes_per_position.append(pos_all_layers)
-            middle_hidden_states.append(current_input[:, 2:-1, :])
-
-        # Concatenate across positions: [batch, num_code_groups, seq_len]
-        result_codes = torch.cat(all_codes_per_position, dim=2)
-
-        # Build summed embeddings for each position (like Transformers)
-        # This combines layer-0 embed, mid layers hidden states, and last layer embed
-        all_summed_embeddings = []
+        result_codes = torch.empty(
+            batch_size,
+            self.num_code_groups,
+            seq_len,
+            dtype=torch.int64,
+            device=device,
+        )
+        summed_embeddings = torch.empty(
+            batch_size,
+            seq_len,
+            hidden_size,
+            dtype=inputs_embeds.dtype,
+            device=device,
+        )
 
         for pos in range(seq_len):
-            # Layer 0 embedding
-            layer0_code = result_codes[:, 0, pos : pos + 1]  # [batch, 1]
-            layer0_embed = self.embed_input_ids(layer0_code)  # [batch, 1, hidden_size]
+            layer0_code = input_ids[:, pos : pos + 1]
+            layer0_embed = embed_fn(layer0_code)
 
-            # mid layers hidden states (from CodePredictor)
-            mid_residual_hiddens = middle_hidden_states[pos]  # [batch, num_code_groups-2, hidden_size]
-            mid_list = list(mid_residual_hiddens.split(1, dim=1))
-
-            # last layer embedding
-            last_layer_code = result_codes[:, -1, pos : pos + 1]  # [batch, 1]
-            last_residual_hidden = self.code_predictor.model.codec_embedding[-1](last_layer_code)
-
-            # Concatenate all layers: [batch, num_code_groups, hidden_size]
-            pos_codec_hiddens = torch.cat(
-                [layer0_embed] + mid_list + [last_residual_hidden],
-                dim=1,
+            pos_all_layers, proj_buf = self.code_predictor(
+                layer0_code,
+                layer0_embed,
+                last_talker_hidden,
             )
 
-            # Sum across layers: [batch, 1, hidden_size] (like Transformers)
-            pos_summed = pos_codec_hiddens.sum(dim=1, keepdim=True)
-            all_summed_embeddings.append(pos_summed)
-
-        # Concatenate across positions: [batch, seq_len, hidden_size]
-        summed_embeddings = torch.cat(all_summed_embeddings, dim=1).squeeze(1)
+            result_codes[:, :, pos : pos + 1] = pos_all_layers
+            # proj_buf layout: [0]=talker_hidden, [1..G]=codec embeds
+            summed_embeddings[:, pos, :] = proj_buf[:, 1:, :].sum(dim=1)
 
         return result_codes, summed_embeddings
-
-    def init_multi_modal(self, thinker_config: Any) -> None:
-        """
-        Initialize multimodal components from the thinker.
-
-        Unlike Qwen2.5 Omni which creates audio_tower and visual encoders here,
-        Qwen3 Omni MoE has a cleaner separation: the thinker is the ONLY module
-        that processes raw multimodal inputs. The talker only handles text-to-audio
-        conversion using pre-processed embeddings from the thinker.
-
-        This method exists for API compatibility and stores the thinker config
-        for reference. The actual multimodal processing components (audio_tower,
-        visual) are ONLY in the thinker, not duplicated in the talker.
-
-        Args:
-            thinker_config: Configuration from the thinker model (for reference only)
-        """
-        self.audio_tower = Qwen3OmniMoeAudioEncoder(thinker_config.audio_config)
-        self.visual = Qwen3Omni_VisionTransformer(
-            vision_config=thinker_config.vision_config,
-            norm_eps=getattr(thinker_config.text_config, "rms_norm_eps", 1e-6),
-            quant_config=self.quant_config,
-            prefix=maybe_prefix(self.prefix, "visual"),
-            # attn_backend_override=attn_backend_override,
-        )
 
     def project_thinker_outputs(
         self,
@@ -321,11 +247,15 @@ class Qwen3OmniMoeTalkerForConditionalGeneration(
         self,
         input_ids: torch.Tensor,
         positions: torch.Tensor,
-        inputs_embeds: torch.Tensor,
+        inputs_embeds: torch.Tensor | None = None,
         intermediate_tensors: IntermediateTensors | None = None,
         **kwargs: object,
     ) -> torch.Tensor | IntermediateTensors:
         """Forward pass through the talker model."""
+        if inputs_embeds is None and input_ids is not None:
+            inputs_embeds = self.embed_input_ids(input_ids)
+            input_ids = None
+
         talker_hidden_states, _ = self.language_model.model(
             input_ids,
             positions,
@@ -355,89 +285,8 @@ class Qwen3OmniMoeTalkerForConditionalGeneration(
         """Create empty intermediate tensors for pipeline parallelism."""
         return self.language_model.make_empty_intermediate_tensors(batch_size, dtype, device)
 
-    def _parse_and_validate_multimodal_inputs(self, **kwargs: object) -> dict:
-        mm_input_by_modality = {}
-
-        # Preserve the order of modalities if there are multiple of them
-        # from the order of kwargs.
-        for input_key in kwargs:
-            if input_key in ("pixel_values", "image_embeds") and "image" not in mm_input_by_modality:
-                mm_input_by_modality["image"] = self._parse_and_validate_image_input(**kwargs)
-            if input_key in ("pixel_values_videos", "video_embeds") and "video" not in mm_input_by_modality:
-                mm_input_by_modality["video"] = self._parse_and_validate_video_input(**kwargs)
-            if input_key in ("input_audio_features") and "audio" not in mm_input_by_modality:
-                mm_input_by_modality["audio"] = self._parse_and_validate_audio_input(**kwargs)
-        return mm_input_by_modality
-
-    def embed_multimodal(self, **kwargs: object) -> MultiModalEmbeddings | None:
-        mm_input_by_modality = self._parse_and_validate_multimodal_inputs(**kwargs)
-        if not mm_input_by_modality:
-            return []
-
-        logger.warning(
-            "\n\n\n"
-            "THIS FUNCTION RETURNS DUMMY MULTIMODAL EMBEDDINGS FOR PROFILE RUN, "
-            "SHOULD NOT BE CALLED IN INFERENCE."
-            "\n\n\n"
-        )
-
-        # The result multimodal_embeddings is tuple of tensors, with each
-        # tensor correspoending to a multimodal data item (image or video).
-        dummy_multimodal_embeddings: tuple[torch.Tensor, ...] = ()
-
-        # NOTE: It is important to iterate over the keys in this dictionary
-        # to preserve the order of the modalities.
-        # TODO: do projection for all multimodel
-        for modality in mm_input_by_modality:
-            multimodal_input = mm_input_by_modality[modality]
-            if modality == "image":
-                image_embeddings = self._process_image_input(multimodal_input)
-                dummy_image_embeddings = ()
-                for image_embed in image_embeddings:
-                    dummy_image_embeddings += (
-                        torch.zeros(
-                            image_embed.shape[0],
-                            self.config.text_config.hidden_size,
-                            device=image_embed.device,
-                            dtype=torch.bfloat16,
-                        ),
-                    )
-                dummy_multimodal_embeddings += tuple(image_embeddings)
-            if modality == "video":
-                video_embeddings = self._process_video_input(multimodal_input)
-                dummy_video_video_embeddings = ()
-                for video_embed in video_embeddings:
-                    dummy_video_video_embeddings += (
-                        torch.zeros(
-                            video_embed.shape[0],
-                            self.config.text_config.hidden_size,
-                            device=video_embed.device,
-                            dtype=torch.bfloat16,
-                        ),
-                    )
-                dummy_multimodal_embeddings += tuple(dummy_video_video_embeddings)
-            if modality == "audio":
-                audio_embeddings = self._process_audio_input(multimodal_input)
-                dummy_audio_embeddings = ()
-                for audio_embed in audio_embeddings:
-                    dummy_audio_embeddings += (
-                        torch.zeros(
-                            audio_embed.shape[0],
-                            self.config.text_config.hidden_size,
-                            device=audio_embed.device,
-                            dtype=torch.bfloat16,
-                        ),
-                    )
-                dummy_multimodal_embeddings += tuple(dummy_audio_embeddings)
-        return dummy_multimodal_embeddings
-
-    def embed_input_ids(
-        self,
-        input_ids: torch.Tensor,
-        multimodal_embeddings: MultiModalEmbeddings | None = None,
-        is_multimodal: bool = False,
-    ):
-        """Get the input embedding layer (for codec tokens)."""
+    def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
+        """Embed codec input IDs."""
         return self.language_model.embed_input_ids(input_ids)
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
@@ -472,13 +321,6 @@ class Qwen3OmniMoeTalkerForConditionalGeneration(
         except Exception:
             logger.error("Error logging model load summary")
 
-        multi_model_weights = set()
-        for name, param in self.visual.named_parameters():
-            multi_model_weights.add("visual." + name)
-        for name, param in self.audio_tower.named_parameters():
-            multi_model_weights.add("audio_tower." + name)
-        loaded.update(multi_model_weights)
-
         return loaded
 
 
@@ -510,7 +352,7 @@ class Qwen3OmniMoeModel(Qwen3MoeLLMForCausalLM):
     """
     Qwen3 Omni MoE Talker language model.
 
-    Extends Qwen3MoeLLMForCausalLM (which already uses SharedFusedMoE with
+    Extends Qwen3MoeLLMForCausalLM (which already uses FusedMoE with
     shared-expert support) and replaces the text embedding / LM head with a
     codec embedding so the talker operates over audio-codec tokens instead
     of text tokens.

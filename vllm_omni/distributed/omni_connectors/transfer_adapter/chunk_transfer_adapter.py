@@ -3,10 +3,13 @@
 
 import importlib
 from collections import defaultdict, deque
+from collections.abc import Callable
 from typing import Any
 
 import torch
 from vllm.v1.request import Request, RequestStatus
+
+from vllm_omni.data_entry_keys import OmniPayloadStruct, unflatten_payload
 
 from ..factory import OmniConnectorFactory
 from ..utils.config import ConnectorSpec
@@ -39,9 +42,9 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
         self.scheduler_max_num_seqs = vllm_config.scheduler_config.max_num_seqs
         self.connector = self.create_connector(model_config)
         super().__init__(model_config)
-        self.model_mode = getattr(model_config, "worker_type", "ar")
+        self.model_mode = getattr(model_config, "worker_type", None) or "ar"
         # State specific to Chunk management
-        self.custom_process_next_stage_input_func = None
+        self.custom_process_next_stage_input_func: Callable[..., OmniPayloadStruct | None] | None = None
         custom_process_next_stage_input_func = getattr(model_config, "custom_process_next_stage_input_func", None)
         if custom_process_next_stage_input_func:
             module_path, func_name = custom_process_next_stage_input_func.rsplit(".", 1)
@@ -52,12 +55,13 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
         self.get_req_chunk: dict[str, int] = defaultdict(int)
         self.finished_requests: set[str] = set()
         self.request_payload = {}
-        self.code_prompt_token_ids: dict[str, list[list[int]]] = defaultdict(list)
+        self.code_prompt_token_ids: dict[str, list[torch.Tensor]] = defaultdict(list)
         self.request_ids_mapping: dict[str, str] = {}
 
         self.waiting_for_chunk_waiting_requests: deque[Any] = deque()
         self.waiting_for_chunk_running_requests: deque[Any] = deque()
         self.requests_with_ready_chunks = set()
+        self.requests_origin_status = {}
 
     @classmethod
     def create_connector(cls, model_config: Any):
@@ -89,136 +93,173 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
             request: The request object needing data.
         """
         stage_id = self.connector.stage_id
-        request_id = request.request_id
-        self.request_ids_mapping[request_id] = request.external_req_id
 
         if stage_id == 0:
             return
         if not hasattr(request, "additional_information"):
             request.additional_information = None
-        with self.lock:
-            self._pending_load_reqs[request_id] = request
+        self._cancelled_load_reqs.discard(request.request_id)
+        self._pending_load_reqs.append(request)
+        with self._recv_cond:
+            self._recv_cond.notify()
 
-    def save_async(self, pooling_output: torch.Tensor | None = None, request: Request | None = None):
+    def save_async(
+        self,
+        pooling_output: torch.Tensor | None = None,
+        request: Request | None = None,
+    ):
         """Build and enqueue one chunk for asynchronous sending.
 
-        Payload extraction is executed in the caller thread via
-        ``custom_process_next_stage_input_func``
+        Payload extraction happens in ``_send_single_request`` on the
+        background save_loop thread.
 
         Args:
             pooling_output: Partial pooling output dictionary
             request: Request object
         """
+        task = {
+            "pooling_output": pooling_output,
+            "request": request,
+            "is_finished": request.is_finished(),
+        }
+        self._pending_save_reqs.append(task)
+        with self._save_cond:
+            self._save_cond.notify()
+
+    def _poll_single_request(self, request: Request):
+        stage_id = self.connector.stage_id
+        target_stage_id = stage_id - 1
+        req_id = request.request_id
+        chunk_id = self.get_req_chunk[req_id]
+        external_req_id = self.request_ids_mapping.get(req_id, req_id)
+        connector_get_key = f"{external_req_id}_{target_stage_id}_{chunk_id}"
+
+        # Use timeout=0 for non-blocking poll
+        try:
+            result = self.connector.get(
+                str(target_stage_id),
+                str(stage_id),
+                connector_get_key,
+            )
+        except Exception as e:
+            logger.error(f"SharedMemoryConnector get failed for req {connector_get_key}: {e}")
+            return False
+
+        if result is None:
+            return False
+        payload_data, size = result
+
+        if payload_data:
+            # Update connector state
+            self.get_req_chunk[req_id] += 1
+
+            meta = payload_data.get("meta", {})
+            if self.model_mode == "ar":
+                merged_payload = self._update_request_payload(external_req_id, payload_data)
+                request.additional_information = merged_payload
+                if meta.get("finished"):
+                    self.finished_requests.add(req_id)
+            else:
+                if meta.get("finished"):
+                    self.finished_requests.add(req_id)
+
+                new_ids = payload_data.get("codes", {}).get("audio")
+                if isinstance(new_ids, torch.Tensor):
+                    new_ids = new_ids.tolist()
+                elif new_ids is None:
+                    new_ids = []
+                request.prompt_token_ids = new_ids
+                prev_info = getattr(request, "additional_information", None)
+                info = dict(prev_info) if isinstance(prev_info, dict) else {}
+                for key, value in payload_data.items():
+                    if key == "codes":
+                        continue
+                    if isinstance(value, dict):
+                        existing_sub = info.get(key)
+                        merged_sub = dict(existing_sub) if isinstance(existing_sub, dict) else {}
+                        for sk, sv in value.items():
+                            if key == "meta" and sk == "finished":
+                                continue
+                            merged_sub[sk] = sv
+                        info[key] = merged_sub
+                        continue
+                    info[key] = value
+                request.additional_information = info
+                request.num_computed_tokens = 0
+
+                # Empty chunk with more data expected: keep polling.
+                if not new_ids and not meta.get("finished"):
+                    return True
+
+            # Mark as finished for consumption
+            self._finished_load_reqs.add(req_id)
+            logger.debug(f"[Stage-{stage_id}] Received one chunk for key {connector_get_key}")
+            return True
+
+        return False
+
+    def _update_request_payload(self, req_id: str, payload_data: dict[str, Any]) -> dict[str, Any]:
+        """Update the stored payload for *req_id* with the latest chunk."""
+        if req_id not in self.request_payload:
+            self.request_payload[req_id] = payload_data
+            return payload_data
+        origin = self.request_payload[req_id]
+        raw_ok = payload_data.get("meta", {}).pop("override_keys", [])
+        override_keys = {tuple(k) if isinstance(k, list) else k for k in raw_ok}
+
+        for key, value in payload_data.items():
+            if isinstance(value, dict):
+                origin_sub = origin.get(key)
+                if not isinstance(origin_sub, dict):
+                    continue
+                for qual, qval in value.items():
+                    if key == "meta" and qual == "finished":
+                        continue
+                    if (key, qual) in override_keys:
+                        continue
+                    osv = origin_sub.get(qual)
+                    if isinstance(qval, torch.Tensor) and isinstance(osv, torch.Tensor):
+                        value[qual] = torch.cat([osv, qval], dim=0)
+                    elif isinstance(qval, list) and isinstance(osv, list):
+                        value[qual] = osv + qval
+            else:
+                if key in override_keys:
+                    continue
+                ov = origin.get(key)
+                if isinstance(value, torch.Tensor) and isinstance(ov, torch.Tensor):
+                    payload_data[key] = torch.cat([ov, value], dim=0)
+                elif isinstance(value, list) and isinstance(ov, list):
+                    payload_data[key] = ov + value
+
+        self.request_payload[req_id] = payload_data
+        return payload_data
+
+    def _send_single_request(self, task: dict):
+        raw_po = task["pooling_output"]
+        pooling_output = unflatten_payload(raw_po) if isinstance(raw_po, dict) else raw_po
+        request = task["request"]
+        is_finished = task["is_finished"]
         stage_id = self.connector.stage_id
         next_stage_id = stage_id + 1
-        request_id = request.external_req_id
-        chunk_id = self.put_req_chunk[request_id]
-
-        # Process payload in main thread to avoid race conditions on request state
-        payload_data = None
+        external_req_id = request.external_req_id
+        chunk_id = self.put_req_chunk[external_req_id]
+        connector_put_key = f"{external_req_id}_{stage_id}_{chunk_id}"
+        # Process payload in save_loop thread
+        payload_data: OmniPayloadStruct | None = None
         if self.custom_process_next_stage_input_func:
             try:
                 payload_data = self.custom_process_next_stage_input_func(
                     transfer_manager=self,
                     pooling_output=pooling_output,
                     request=request,
+                    is_finished=is_finished,
                 )
 
             except Exception as e:
                 logger.error(f"Failed to use custom_process_input_func for payload extraction: {e}")
 
-        if not payload_data:
+        if payload_data is None:
             return
-
-        # Increment chunk_id
-        self.put_req_chunk[request_id] += 1
-        connector_put_key = f"{request_id}_{stage_id}_{chunk_id}"
-
-        task = {
-            "stage_id": stage_id,
-            "next_stage_id": next_stage_id,
-            "put_key": connector_put_key,
-            "data": payload_data,
-            "request_id": request_id,
-        }
-
-        with self.lock:
-            if request_id not in self._pending_save_reqs:
-                self._pending_save_reqs[request_id] = deque()
-            self._pending_save_reqs[request_id].append(task)
-
-    def _poll_single_request(self, req_id: str):
-        stage_id = self.connector.stage_id
-        target_stage_id = stage_id - 1
-        chunk_id = self.get_req_chunk[req_id]
-        external_req_id = self.request_ids_mapping.get(req_id, req_id)
-        connector_get_key = f"{external_req_id}_{target_stage_id}_{chunk_id}"
-
-        # Use timeout=0 for non-blocking poll
-        result = self.connector.get(
-            str(target_stage_id),
-            str(stage_id),
-            connector_get_key,
-        )
-
-        if result is None:
-            return
-
-        payload_data, size = result
-
-        if payload_data:
-            # Update connector state
-            self.get_req_chunk[req_id] += 1
-            req = self._pending_load_reqs[req_id]
-
-            if self.model_mode == "ar":
-                self._update_request_payload(external_req_id, payload_data)
-                req.additional_information = payload_data
-                if payload_data.get("finished"):
-                    self.finished_requests.add(req_id)
-            else:
-                if payload_data.get("finished"):
-                    self.finished_requests.add(req_id)
-                    req.status = RequestStatus.FINISHED_STOPPED
-
-                req.prompt_token_ids = payload_data.get("code_predictor_codes", [])
-                req.num_computed_tokens = 0
-
-            # Mark as finished for consumption
-            with self.lock:
-                self._finished_load_reqs.add(req_id)
-                if req_id in self._pending_load_reqs:
-                    del self._pending_load_reqs[req_id]
-            logger.debug(f"[Stage-{stage_id}] Received one chunk for key {connector_get_key}")
-
-    def _update_request_payload(self, req_id: str, payload_data: dict[str, Any]) -> dict[str, Any]:
-        """Update the payload data for a request in the connector.
-
-        Args:
-            connector: OmniConnectorBase instance
-            req_id: Request ID to update
-            payload_data: New payload data to store
-        """
-        if req_id not in self.request_payload:
-            self.request_payload[req_id] = payload_data
-            return payload_data
-        origin_payload = self.request_payload[req_id]
-        for key, value in payload_data.items():
-            if key == "finished":
-                continue
-            elif isinstance(value, torch.Tensor) and key in origin_payload:
-                payload_data[key] = torch.cat([origin_payload[key], value], dim=0)
-            elif isinstance(value, list) and key in origin_payload:
-                payload_data[key] = origin_payload[key] + value
-
-        self.request_payload[req_id] = payload_data
-        return payload_data
-
-    def _send_single_request(self, task: dict):
-        connector_put_key = task["put_key"]
-        stage_id = task["stage_id"]
-        next_stage_id = task["next_stage_id"]
-        payload_data = task["data"]
 
         success, size, metadata = self.connector.put(
             from_stage=str(stage_id),
@@ -228,7 +269,88 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
         )
 
         if success:
+            self.put_req_chunk[external_req_id] += 1
             logger.debug(f"[Stage-{stage_id}] Sent {connector_put_key}")
+            # Sender uses struct attr access here; the receive path in
+            # `_load_one_request` / `_update_request_payload` reads dict keys.
+            # That asymmetry is intentional: `OmniMsgpackDecoder` is type-erased
+            # (no target type), so the wire round-trips struct -> dict. If you
+            # change the schema, update both ends — see test_wire_round_trip.
+            finished_flag = payload_data.meta.finished if payload_data.meta is not None else None
+            is_payload_finished = False
+            if isinstance(finished_flag, torch.Tensor):
+                is_payload_finished = finished_flag.numel() == 1 and bool(finished_flag.item())
+            elif finished_flag is not None:
+                is_payload_finished = bool(finished_flag)
+
+            # Reclaim per-request async state only after the terminal payload
+            # has been sent successfully. This avoids cleanup->save races.
+            if is_payload_finished:
+                self.cleanup(request.request_id, external_req_id)
+
+        if is_finished:
+            self.code_prompt_token_ids.pop(external_req_id, None)
+            cached_ic = getattr(self, "_cached_ic", None)
+            if cached_ic is not None:
+                cached_ic.pop(external_req_id, None)
+
+    ########################################################################
+    # Cleanup
+    ########################################################################
+
+    def cleanup_receiver(self, request_id: str) -> None:
+        """Reclaim receiver-side per-request state (keyed by internal id).
+
+        Safe to call from the scheduler even when ``save_async()`` has
+        enqueued work that the background thread has not yet processed,
+        because it only touches receiver-side dictionaries.
+
+        Idempotent: calling with an already-cleaned or unknown id is safe.
+        """
+        self.finished_requests.discard(request_id)
+        self.get_req_chunk.pop(request_id, None)
+        self.requests_with_ready_chunks.discard(request_id)
+        self.request_ids_mapping.pop(request_id, None)
+        self.requests_origin_status.pop(request_id, None)
+
+        self._cancelled_load_reqs.add(request_id)
+        self._finished_load_reqs.discard(request_id)
+
+    def cleanup_sender(self, external_req_id: str) -> None:
+        """Reclaim sender-side per-request state (keyed by external id).
+
+        Must only be called after the terminal chunk has actually been
+        sent (i.e. from ``_send_single_request``), not before.
+
+        Idempotent: calling with an already-cleaned or unknown id is safe.
+        """
+        self.put_req_chunk.pop(external_req_id, None)
+        self.request_payload.pop(external_req_id, None)
+        self.code_prompt_token_ids.pop(external_req_id, None)
+
+        cached_ic = getattr(self, "_cached_ic", None)
+        if cached_ic is not None:
+            cached_ic.pop(external_req_id, None)
+
+    def cleanup(
+        self,
+        request_id: str,
+        external_req_id: str | None = None,
+    ) -> None:
+        """Reclaim all per-request state after a request finishes.
+
+        Idempotent: calling with an already-cleaned or unknown id is safe.
+
+        Args:
+            request_id: Internal request id (receive / scheduler side key).
+            external_req_id: External request id (send / payload side key).
+                When *None*, looked up from ``request_ids_mapping``.
+        """
+        if external_req_id is None:
+            external_req_id = self.request_ids_mapping.get(request_id, request_id)
+
+        self.cleanup_receiver(request_id)
+        self.cleanup_sender(external_req_id)
 
     ########################################################################
     # Schedule Helper
@@ -244,15 +366,15 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
         """
         if self.connector.stage_id == 0:
             return
-        finished_load_reqs = self.get_finished_requests()
         self._process_chunk_queue(
-            waiting_queue, self.waiting_for_chunk_waiting_requests, RequestStatus.WAITING, finished_load_reqs
+            waiting_queue, self.waiting_for_chunk_waiting_requests, RequestStatus.WAITING, self._finished_load_reqs
         )
         self._process_chunk_queue(
-            running_queue, self.waiting_for_chunk_running_requests, RequestStatus.RUNNING, finished_load_reqs
+            running_queue, self.waiting_for_chunk_running_requests, RequestStatus.RUNNING, self._finished_load_reqs
         )
         while len(running_queue) > self.scheduler_max_num_seqs:
             request = running_queue.pop()
+            request.status = RequestStatus.PREEMPTED
             waiting_queue.prepend_requests([request])
 
     def restore_queues(self, waiting_queue: Any, running_queue: list[Request]) -> None:
@@ -308,7 +430,6 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
                     # of schedule, but have not scheduled
                     continue
                 if request.request_id in self.finished_requests:
-                    request.additional_information = {}
                     continue
                 # Requests that waiting for chunk
                 self.load_async(request)
@@ -316,9 +437,11 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
             else:
                 if request.request_id in finished_load_reqs:
                     request.status = target_status
+                    finished_load_reqs.remove(request.request_id)
                     self.requests_with_ready_chunks.add(request.request_id)
                     continue
             queue.remove(request)
+            self.requests_origin_status[request.request_id] = target_status
             waiting_for_chunk_list.append(request)
 
     def _clear_chunk_ready(self, scheduler_output: Any) -> None:
@@ -332,8 +455,22 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
                 if req_id in self.requests_with_ready_chunks:
                     self.requests_with_ready_chunks.remove(req_id)
 
-    def get_finished_requests(self):
-        with self.lock:
-            finished_load = set(self._finished_load_reqs)
-            self._finished_load_reqs = set()
-        return finished_load
+    def finish_requests(
+        self, request_ids: Any, finished_status: RequestStatus, requests: dict[str, Request] | None = None
+    ) -> list[tuple[str, int]]:
+        assert RequestStatus.is_finished(finished_status)
+        if isinstance(request_ids, str):
+            request_ids = (request_ids,)
+        elif request_ids is not None:
+            request_ids = set(request_ids)
+        else:
+            request_ids = requests.keys()
+
+        # First pass: collect requests to remove from queues
+        for req_id in request_ids:
+            request = requests.get(req_id) if requests else None
+            if request is None or request.is_finished():
+                # Invalid request ID.
+                continue
+            if req_id in self.requests_origin_status:
+                request.status = self.requests_origin_status.pop(req_id)

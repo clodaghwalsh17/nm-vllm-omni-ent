@@ -15,6 +15,12 @@ import torch
 from vllm_omni.diffusion.attention.backends.abstract import AttentionMetadata
 from vllm_omni.diffusion.attention.backends.flash_attn import FlashAttentionImpl
 from vllm_omni.diffusion.attention.backends.sdpa import SDPAImpl
+from vllm_omni.diffusion.attention.backends.utils import fa  # noqa: E402
+from vllm_omni.platforms import current_omni_platform
+
+is_gpu = current_omni_platform.is_cuda_alike() or current_omni_platform.is_xpu()
+HAS_FLASH_ATTN = fa.HAS_FLASH_ATTN
+flash_attn_func = fa.flash_attn_func  # noqa: N813
 
 
 def create_attention_mask(batch_size: int, seq_len: int, valid_len: int, device: torch.device) -> torch.Tensor:
@@ -56,7 +62,7 @@ def pad_tensor(tensor: torch.Tensor, target_seq_len: int, pad_value: float = 0.0
     return torch.cat([tensor, padding], dim=1)
 
 
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="FlashAttention requires CUDA")
+@pytest.mark.skipif(not is_gpu, reason="FlashAttention requires CUDA or XPU")
 def test_padding_equivalence():
     """
     Case 1: Test that padded and unpadded inputs produce similar outputs.
@@ -68,7 +74,7 @@ def test_padding_equivalence():
 
     Expected: Output A and Output B should be very close.
     """
-    device = torch.device("cuda")
+    device = torch.device(current_omni_platform.device_type)
     dtype = torch.bfloat16
 
     # Configuration
@@ -149,7 +155,7 @@ def test_padding_equivalence():
     print("✓ Case 1 PASSED: Padded and unpadded outputs are very close!")
 
 
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="FlashAttention requires CUDA")
+@pytest.mark.skipif(not is_gpu, reason="FlashAttention requires CUDA or XPU")
 def test_fa_vs_sdpa():
     """
     Case 2: Compare FlashAttention and SDPA backends with padding.
@@ -162,7 +168,7 @@ def test_fa_vs_sdpa():
 
     Expected: FA and SDPA outputs should be very close.
     """
-    device = torch.device("cuda")
+    device = torch.device(current_omni_platform.device_type)
     dtype = torch.bfloat16
 
     # Configuration
@@ -261,12 +267,42 @@ def test_fa_vs_sdpa():
     print("✓ Case 2 PASSED: FA and SDPA outputs are very close!")
 
 
+@pytest.mark.skipif(not is_gpu, reason="FlashAttention requires CUDA or XPU")
+def test_flash_attn_func_preferred_over_varlen():
+    """Test flash_attn_func availability and basic forward call."""
+    if not HAS_FLASH_ATTN:
+        pytest.skip("No Flash Attention available")
+
+    if flash_attn_func is None:
+        pytest.skip("flash_attn_func not available, will use varlen fallback")
+
+    device = torch.device(current_omni_platform.device_type)
+    dtype = torch.bfloat16
+
+    num_heads, head_dim = 8, 64
+    fa_impl = FlashAttentionImpl(
+        num_heads=num_heads, head_size=head_dim, softmax_scale=1.0 / (head_dim**0.5), causal=False
+    )
+
+    torch.manual_seed(42)
+    q = torch.randn(1, 32, num_heads, head_dim, device=device, dtype=dtype)
+    k = q.clone()
+    v = q.clone()
+
+    attn_metadata = AttentionMetadata(attn_mask=None)
+    output = fa_impl.forward(q, k, v, attn_metadata)
+
+    assert output.shape == q.shape
+    assert not torch.isnan(output).any()
+    print("✓ flash_attn_func forward works correctly!")
+
+
 if __name__ == "__main__":
     print("Running FlashAttention Padding Tests...")
     print("=" * 60)
 
-    # Try to run CUDA tests
-    if torch.cuda.is_available():
+    # Try to run tests
+    if is_gpu:
         try:
             print("\n[Running Case 1: Padding Equivalence for FA]")
             test_padding_equivalence()

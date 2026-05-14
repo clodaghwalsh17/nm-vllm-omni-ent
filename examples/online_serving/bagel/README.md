@@ -1,108 +1,162 @@
 # BAGEL-7B-MoT
 
-## 🛠️ Installation
+## Installation
 
 Please refer to [README.md](../../../README.md)
 
-## Run examples (BAGEL-7B-MoT)
+## Architecture
 
-**Note**: These examples work with the default configuration on an **NVIDIA A100 (80GB)**. We also tested on dual **NVIDIA RTX 5000 Ada (32GB each)**. For dual-GPU setups, please modify the stage configuration to distribute the model across devices.
+BAGEL-7B-MoT is a Mixture-of-Transformers (MoT) model supporting both image generation and understanding. It offers two deployment topologies:
 
-### Launch the Server
+| Topology | Stages | Description |
+| :------- | :----- | :---------- |
+| **Two-stage** (default) | Stage 0 (Thinker, AR) + Stage 1 (DiT, Diffusion) | Thinker handles text/understanding via vLLM AR engine; DiT handles image generation. KV cache is transferred between stages. |
+| **Single-stage** | Stage 0 (DiT, Diffusion) only | The DiT stage contains a full LLM, ViT, VAE, and tokenizer internally. All modalities are handled within a single diffusion process. |
+
+Both topologies support all four modalities: `text2img`, `img2img`, `img2text`, `text2text`.
+
+> **Note**: These examples work with the default configuration on an **NVIDIA A100 (80GB)**. We also tested on dual **NVIDIA RTX 5000 Ada (32GB each)**. For dual-GPU setups, modify the deploy YAML to distribute stages across devices.
+
+## Launch the Server
+
+### Two-Stage (Default)
+
+The default pipeline is auto-detected from the model. No extra flags needed:
 
 ```bash
-# Use default configuration
 vllm serve ByteDance-Seed/BAGEL-7B-MoT --omni --port 8091
 ```
 
 Or use the convenience script:
 
 ```bash
-cd /workspace/vllm-omni/examples/online_serving/bagel
+cd examples/online_serving/bagel
 bash run_server.sh
+
+# Initialize each stage in a discrete isolated process terminal
+bash run_server_stage_cli.sh --stage 0
+bash run_server_stage_cli.sh --stage 1
 ```
+
+To use a custom deploy YAML, pass it via `--deploy-config`:
 
 ```bash
-vllm serve ByteDance-Seed/BAGEL-7B-MoT --omni --port 8091 --stage-configs-path /path/to/stage_configs_file
+vllm serve ByteDance-Seed/BAGEL-7B-MoT --omni --port 8091 \
+    --deploy-config /path/to/deploy_config.yaml
 ```
 
-#### 🚀 Tensor Parallelism (TP)
+See [`bagel.yaml`](../../../vllm_omni/deploy/bagel.yaml) for the default two-stage deploy configuration.
 
-For larger models or multi-GPU environments, you can enable Tensor Parallelism (TP) for the server.
+### Single-Stage
 
-1. **Modify Stage Config**: Create or modify a stage configuration yaml (e.g., [`bagel.yaml`](../../../vllm_omni/model_executor/stage_configs/bagel.yaml)). Set `tensor_parallel_size` to `2` (or more) and update `devices` to include multiple GPU IDs (e.g., `"0,1"`).
+The DiT stage contains a full LLM, ViT, VAE, and tokenizer, so it can handle all modalities (text2img, img2img, img2text, text2text, think) without a separate Thinker stage:
 
+```bash
+vllm serve ByteDance-Seed/BAGEL-7B-MoT --omni --port 8091 \
+    --deploy-config vllm_omni/deploy/bagel_single_stage.yaml
+```
+
+See [`bagel_single_stage.yaml`](../../../vllm_omni/deploy/bagel_single_stage.yaml) for configuration. The `pipeline: bagel_single_stage` field selects the single-stage topology from the pipeline registry.
+
+### Tensor Parallelism (TP)
+
+For larger models or multi-GPU environments, enable TP via CLI:
+
+```bash
+vllm serve ByteDance-Seed/BAGEL-7B-MoT --omni --port 8091 --tensor-parallel-size 2
+```
+
+Or set `tensor_parallel_size` per stage in a custom deploy YAML.
+
+#### Hybrid Sharded Data Parallel (HSDP)
+
+For larger Bagel deployments on multiple GPUs, you can enable HSDP (Hybrid Sharded Data Parallel) by modifying the stage configuration (for example, [`bagel.yaml`](../../../vllm_omni/deploy/bagel.yaml)). HSDP shards transformer weights across GPUs to reduce per-GPU memory usage.
+
+1. **Enable HSDP**: Set `use_hsdp: true`.
+2. **Set shard size**: Set `hsdp_shard_size` to the number of GPUs used for sharding (for example, `4`).
+3. **Set replicate size**: Usually keep `hsdp_replicate_size: 1` unless you want replicated HSDP groups.
+4. **Set devices**: Specify the comma-separated GPU IDs used by the diffusion stage (for example, `"0,1,2,3"`).
+
+Example configuration for HSDP across 4 GPUs:
 ```yaml
-    engine_args:
-      tensor_parallel_size: 2
-      ...
-    runtime:
-      devices: "0,1"
+  - stage_id: 1
+    devices: "0,1,2,3"
+    parallel_config:
+      use_hsdp: true
+      hsdp_shard_size: 4
+      hsdp_replicate_size: 1
 ```
 
-2. **Launch Server**:
+### Multi-Node Deployment
+
+Deploy each stage on a **separate node** for better resource utilization. Replace `<ORCHESTRATOR_IP>` with the actual IP address of your orchestrator node.
+
+**1. Launch Stage 0 (Thinker / Orchestrator)** on the orchestrator node:
+
 ```bash
-vllm serve ByteDance-Seed/BAGEL-7B-MoT --omni --port 8091 --stage-configs-path /path/to/your/custom_bagel.yaml
+# API server port for client requests: 8000
+vllm serve ByteDance-Seed/BAGEL-7B-MoT --omni \
+    --port 8000 \
+    --stage-id 0 \
+    --omni-master-address <ORCHESTRATOR_IP> \
+    --omni-master-port 8091
 ```
 
-### Send Multi-modal Request
+**2. Launch Stage 1 (DiT)** on the remote node in headless mode:
 
-Get into the bagel folder:
+```bash
+vllm serve ByteDance-Seed/BAGEL-7B-MoT --omni \
+    --stage-id 1 \
+    --headless \
+    --omni-master-address <ORCHESTRATOR_IP> \
+    --omni-master-port 8091
+```
+
+Or use the convenience script:
+
+```bash
+# Terminal 1: Stage 0
+bash run_server_stage_cli.sh --stage 0
+
+# Terminal 2: Stage 1
+bash run_server_stage_cli.sh --stage 1
+
+# With extra args
+bash run_server_stage_cli.sh --stage 0 -- --tensor-parallel-size 2
+bash run_server_stage_cli.sh --stage 1 -- --gpu-memory-utilization 0.9
+```
+
+**vllm serve arguments:**
+
+| Argument | Description |
+| :------- | :---------- |
+| `--stage-id` | Which stage this process runs (0 = Thinker, 1 = DiT) |
+| `--headless` | Run without the API server (worker-only mode) |
+| `-oma` / `--omni-master-address` | Orchestrator master address |
+| `-omp` / `--omni-master-port` | Orchestrator master port |
+
+> [!IMPORTANT]
+> **Startup Order**: Stage 0 (orchestrator) must be launched **before** Stage 1 (headless).
+> Stage 0 will appear to hang on startup until Stage 1 (worker) connects — this is expected behavior.
+
+### Inter-Stage Connectors
+
+When deploying stages across nodes, configure the connector type in the deploy YAML:
+
+- **SharedMemoryConnector** (default): Used for single-node deployments. No explicit configuration needed.
+- **MooncakeTransferEngineConnector**: For multi-node setups with RDMA hardware. Defined in [`bagel.yaml`](../../../vllm_omni/deploy/bagel.yaml) under `connectors.rdma_connector`.
+
+To use Mooncake, create a custom deploy YAML that binds `output_connectors` / `input_connectors` on each stage to the `rdma_connector` defined in the `connectors` section.
+
+## Send Requests
 
 ```bash
 cd examples/online_serving/bagel
 ```
 
-Send request via Python
-
-```bash
-python openai_chat_client.py --prompt "A cute cat" --modality text2img
-```
-
-The Python client supports the following command-line arguments:
-
-- `--prompt` (or `-p`): Text prompt for generation (default: `A cute cat`)
-- `--output` (or `-o`): Output file path for image results (default: `bagel_output.png`)
-- `--server` (or `-s`): Server URL (default: `http://localhost:8091`)
-- `--image-url` (or `-i`): Input image URL or local file path (for img2img/img2text modes)
-- `--modality` (or `-m`): Task modality (default: `text2img`). Options: `text2img`, `img2img`, `img2text`, `text2text`
-- `--height`: Image height in pixels (default: 512)
-- `--width`: Image width in pixels (default: 512)
-- `--steps`: Number of inference steps (default: 25)
-- `--seed`: Random seed (default: 42)
-- `--negative`: Negative prompt for image generation
-
-Example with custom parameters:
-
-```bash
-python openai_chat_client.py \
-    --prompt "A futuristic city" \
-    --modality text2img \
-    --height 768 \
-    --width 768 \
-    --steps 50 \
-    --seed 42 \
-    --negative "blurry, low quality"
-```
-
-## Modality Control
-
-BAGEL-7B-MoT supports **multiple modality modes** for different use cases.
-
-The default yaml configuration deploys Thinker and DiT on the same GPU. You can use the default configuration file: [`bagel.yaml`](../../../vllm_omni/model_executor/stage_configs/bagel.yaml)
-
-| Modality    | Input        | Output | Description                            |
-| ----------- | ------------ | ------ | -------------------------------------- |
-| `text2img`  | Text         | Image  | Generate images from text prompts      |
-| `img2img`   | Image + Text | Image  | Transform images using text guidance   |
-| `img2text`  | Image + Text | Text   | Generate text descriptions from images |
-| `text2text` | Text         | Text   | Pure text generation                   |
-
 ### Text to Image (text2img)
 
-Generate images from text prompts:
-
-**Using Python client**
+**Python client:**
 
 ```bash
 python openai_chat_client.py \
@@ -112,7 +166,7 @@ python openai_chat_client.py \
     --steps 50
 ```
 
-**Using curl**
+**curl:**
 
 ```bash
 curl http://localhost:8091/v1/chat/completions \
@@ -127,12 +181,9 @@ curl http://localhost:8091/v1/chat/completions \
   }'
 ```
 
-
 ### Image to Image (img2img)
 
-Transform images based on text prompts:
-
-**Using Python client**
+**Python client:**
 
 ```bash
 python openai_chat_client.py \
@@ -142,7 +193,7 @@ python openai_chat_client.py \
     --output transformed.png
 ```
 
-**Using curl**
+**curl:**
 
 ```bash
 IMAGE_BASE64=$(base64 -w 0 cat.jpg)
@@ -167,14 +218,11 @@ EOF
 curl http://localhost:8091/v1/chat/completions \
   -H "Content-Type: application/json" \
   -d @payload.json
-
 ```
 
 ### Image to Text (img2text)
 
-Generate text descriptions from images:
-
-**Using Python client**
+**Python client:**
 
 ```bash
 python openai_chat_client.py \
@@ -183,7 +231,7 @@ python openai_chat_client.py \
     --image-url /path/to/image.jpg
 ```
 
-**Using curl**
+**curl:**
 
 ```bash
 IMAGE_BASE64=$(base64 -w 0 cat.jpg)
@@ -208,9 +256,7 @@ curl http://localhost:8091/v1/chat/completions \
 
 ### Text to Text (text2text)
 
-Pure text generation:
-
-**Using Python client**
+**Python client:**
 
 ```bash
 python openai_chat_client.py \
@@ -218,30 +264,78 @@ python openai_chat_client.py \
     --modality text2text
 ```
 
-**Using curl**
+**curl:**
 
 ```bash
 curl http://localhost:8091/v1/chat/completions \
   -H "Content-Type: application/json" \
   -d '{
-    "messages": [{"role": "user", "content": [{"type": "text", "text": "<|im_start|>user\nWhat is the capital of France?<|im_end|>\n<|im_start|>assistant\n"}]}]
+    "messages": [{"role": "user", "content": [{"type": "text", "text": "<|im_start|>user\nWhat is the capital of France?<|im_end|>\n<|im_start|>assistant\n"}]}],
     "modalities": ["text"]
   }'
 ```
 
-## FAQ
+### Python Client Arguments
 
-- If you encounter an error about the backend of librosa, try to install ffmpeg with the command below.
+| Argument | Default | Description |
+| :------- | :------ | :---------- |
+| `--prompt` / `-p` | `A cute cat` | Text prompt |
+| `--output` / `-o` | `bagel_output.png` | Output file path |
+| `--server` / `-s` | `http://localhost:8091` | Server URL |
+| `--image-url` / `-i` | `None` | Input image URL or local path (img2img/img2text) |
+| `--modality` / `-m` | `text2img` | `text2img`, `img2img`, `img2text`, `text2text` |
+| `--height` | `512` | Image height in pixels |
+| `--width` | `512` | Image width in pixels |
+| `--steps` | `25` | Number of inference steps |
+| `--seed` | `42` | Random seed |
+| `--negative` | `None` | Negative prompt for CFG |
+
+Example with custom parameters:
 
 ```bash
-sudo apt update
-sudo apt install ffmpeg
+python openai_chat_client.py \
+    --prompt "A futuristic city" \
+    --modality text2img \
+    --height 768 \
+    --width 768 \
+    --steps 50 \
+    --seed 42 \
+    --negative "blurry, low quality"
 ```
 
-- If you don’t know how much VRAM is needed for the model or encounter the OOM error, you can try to decrease the max_model_len.
+## Configuration Reference
 
-| Stage               | VRAM                         |
-| :------------------ | :--------------------------- |
-| Stage-0 (Thinker)   | **15.04 GiB** **+ KV Cache** |
-| Stage-1 (DiT)       | **26.50 GiB**                |
-| Total               | **~42 GiB + KV Cache**       |
+### Deploy YAML Files
+
+| File | Description |
+| :--- | :---------- |
+| [`bagel.yaml`](../../../vllm_omni/deploy/bagel.yaml) | Two-stage default (Thinker + DiT on GPU 0) |
+| [`bagel_single_stage.yaml`](../../../vllm_omni/deploy/bagel_single_stage.yaml) | Single-stage (DiT only) |
+
+### Key Deploy YAML Fields
+
+| Field | Scope | Description |
+| :---- | :---- | :---------- |
+| `pipeline` | top-level | Override auto-detected pipeline (e.g. `bagel_single_stage`) |
+| `stages[].stage_id` | per-stage | Stage identifier (0, 1, ...) |
+| `stages[].devices` | per-stage | GPU device IDs (e.g. `"0"`, `"0,1"`) |
+| `stages[].max_num_seqs` | per-stage | Maximum concurrent sequences |
+| `stages[].gpu_memory_utilization` | per-stage | Fraction of GPU memory to use |
+| `stages[].enforce_eager` | per-stage | Disable CUDA graphs |
+| `stages[].tensor_parallel_size` | per-stage | TP degree for this stage |
+| `connectors` | top-level | Define available connector instances (SHM, Mooncake) |
+| `platforms` | top-level | Platform-specific overrides (e.g. `xpu`) |
+
+## FAQ
+
+- If you encounter OOM errors, try decreasing `max_model_len` or `gpu_memory_utilization` in the deploy YAML.
+
+**Two-stage VRAM usage:**
+
+| Stage | VRAM |
+| :---- | :--- |
+| Stage 0 (Thinker) | **15.04 GiB + KV Cache** |
+| Stage 1 (DiT) | **26.50 GiB** |
+| Total | **~42 GiB + KV Cache** |
+
+**Single-stage VRAM usage:** The DiT loads the full model (~42 GiB) in one process.

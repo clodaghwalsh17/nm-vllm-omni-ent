@@ -26,6 +26,8 @@ from transformers.modeling_utils import ALL_ATTENTION_FUNCTIONS, PreTrainedModel
 from transformers.utils import ModelOutput, auto_docstring, logging
 from transformers.utils.hub import cached_file
 
+from vllm_omni.model_executor.layers.timestep_embedding import DiTTimestepEmbedding
+
 from .configuration_qwen3_tts_tokenizer_v1 import (
     Qwen3TTSTokenizerV1Config,
     Qwen3TTSTokenizerV1DecoderBigVGANConfig,
@@ -624,36 +626,6 @@ class DiTAttention(nn.Module):
         attention_output = self.to_out[1](attention_output)
 
         return attention_output
-
-
-# time step conditioning embedding
-class SinusPositionEmbedding(nn.Module):
-    def __init__(self, dim):
-        super().__init__()
-        self.dim = dim
-
-    def forward(self, hidden_states, scale=1000):
-        device = hidden_states.device
-        half_dim = self.dim // 2
-        emb = math.log(10000) / (half_dim - 1)
-        emb = torch.exp(torch.arange(half_dim, device=device).float() * -emb)
-        emb = scale * hidden_states.unsqueeze(1) * emb.unsqueeze(0)
-        emb = torch.cat((emb.sin(), emb.cos()), dim=-1)
-        return emb.type_as(hidden_states)
-
-
-class DiTTimestepEmbedding(nn.Module):
-    def __init__(self, dim, freq_embed_dim=256):
-        super().__init__()
-        self.time_embed = SinusPositionEmbedding(freq_embed_dim)
-        self.time_mlp = nn.ModuleList([nn.Linear(freq_embed_dim, dim), nn.SiLU(), nn.Linear(dim, dim)])
-
-    def forward(self, timestep):
-        time_hidden = self.time_embed(timestep)
-        time_hidden = time_hidden.to(timestep.dtype)
-        for layer in self.time_mlp:
-            time_hidden = layer(time_hidden)  # b d
-        return time_hidden
 
 
 class DiTDecoderLayer(nn.Module):
@@ -1297,8 +1269,6 @@ class Qwen3TTSTokenizerV1Encoder(Qwen3TTSTokenizerV1EncoderPreTrainedModel):
             n_layer=config.n_layer,
             n_window=config.n_window,
             output_dim=config.output_dim,
-            grad_checkpointing=config.grad_checkpointing,
-            enable_mp=config.enable_mp,
             audio_sequence_parallel=config.audio_sequence_parallel,
             audio_vq_type=config.audio_vq_type,
             audio_vq_layers=config.audio_vq_layers,
@@ -1510,10 +1480,11 @@ class Qwen3TTSTokenizerV1Model(Qwen3TTSTokenizerV1PreTrainedModel):
 
         """
         return_dict = return_dict if return_dict is not None else self.config.return_dict
+        audio_lengths = (audio_codes > -1).sum(1) * self.decode_upsample_rate
 
+        audio_codes = torch.clamp(audio_codes, min=0)
         audio_values = self.decoder(code=audio_codes, reference_mel=ref_mels, conditioning=xvectors)
 
-        audio_lengths = (audio_codes > 0).sum(1) * self.decode_upsample_rate
         audio_values = [a[:length] for a, length in zip(audio_values, audio_lengths)]
 
         if not return_dict:

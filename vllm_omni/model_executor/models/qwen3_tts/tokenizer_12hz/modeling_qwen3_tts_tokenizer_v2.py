@@ -21,7 +21,6 @@ from typing import Any
 import numpy as np
 import torch
 from torch import nn
-from torch.nn import Parameter
 from torch.nn import functional as F
 from transformers import MimiConfig, MimiModel
 from transformers.activations import ACT2FN
@@ -40,12 +39,30 @@ from transformers.processing_utils import Unpack
 from transformers.utils import ModelOutput, auto_docstring, logging
 from transformers.utils.deprecation import deprecate_kwarg
 
+from vllm_omni.model_executor.models.common.snake_activation import SnakeBeta
+
 from .configuration_qwen3_tts_tokenizer_v2 import (
     Qwen3TTSTokenizerV2Config,
     Qwen3TTSTokenizerV2DecoderConfig,
 )
 
 logger = logging.get_logger(__name__)
+
+
+def _default_rope_init(config, device=None, seq_len=None, layer_type=None):
+    """Vanilla sinusoidal RoPE (no scaling).
+
+    transformers>=5.0 removed the 'default' entry from
+    ``ROPE_INIT_FUNCTIONS`` (see ``modeling_rope_utils.py`` in
+    huggingface/transformers), but the speech tokenizer config still
+    declares ``rope_type="default"``. This reimplements the original
+    behaviour.
+    """
+    head_dim = getattr(config, "head_dim", config.hidden_size // config.num_attention_heads)
+    inv_freq = 1.0 / (
+        config.rope_theta ** (torch.arange(0, head_dim, 2, dtype=torch.float32, device=device) / head_dim)
+    )
+    return inv_freq, 1.0
 
 
 @dataclass
@@ -256,7 +273,15 @@ class Qwen3TTSTokenizerV2DecoderRotatoryEmbedding(nn.Module):
         self.original_max_seq_len = config.max_position_embeddings
 
         self.config = config
-        self.rope_init_fn = ROPE_INIT_FUNCTIONS[self.rope_type]
+
+        if self.rope_type in ROPE_INIT_FUNCTIONS:
+            self.rope_init_fn = ROPE_INIT_FUNCTIONS[self.rope_type]
+        elif self.rope_type == "default":
+            self.rope_init_fn = _default_rope_init
+        else:
+            raise ValueError(
+                f"Unsupported rope_type '{self.rope_type}'. Expected one of {list(ROPE_INIT_FUNCTIONS)} or 'default'."
+            )
 
         inv_freq, self.attention_scaling = self.rope_init_fn(self.config, device)
         self.register_buffer("inv_freq", inv_freq, persistent=False)
@@ -575,48 +600,6 @@ class Qwen3TTSTokenizerV2DecoderTransformerModel(Qwen3TTSTokenizerV2DecoderPreTr
         )
 
 
-class SnakeBeta(nn.Module):
-    """
-    A modified Snake function which uses separate parameters for the magnitude of the periodic components
-    Shape:
-        - Input: (B, C, T)
-        - Output: (B, C, T), same shape as the input
-    Parameters:
-        - alpha - trainable parameter that controls frequency
-        - beta - trainable parameter that controls magnitude
-    References:
-        - This activation function is a modified version based on this paper
-          by Liu Ziyin, Tilman Hartwig, Masahito Ueda:
-          https://huggingface.co/papers/2006.08195
-    """
-
-    def __init__(self, in_features, alpha=1.0):
-        super().__init__()
-        self.in_features = in_features
-
-        # initialize alpha
-        self.alpha = Parameter(torch.zeros(in_features) * alpha)
-        self.beta = Parameter(torch.zeros(in_features) * alpha)
-
-        self.no_div_by_zero = 0.000000001
-
-    def forward(self, hidden_states):
-        """
-        Forward pass of the function.
-        Applies the function to the input elementwise.
-        SnakeBeta ∶= x + 1/b * sin^2 (xa)
-        """
-        alpha = self.alpha.unsqueeze(0).unsqueeze(-1)  # line up with x to [B, C, T]
-        beta = self.beta.unsqueeze(0).unsqueeze(-1)
-        alpha = torch.exp(alpha)
-        beta = torch.exp(beta)
-        hidden_states = hidden_states + (1.0 / (beta + self.no_div_by_zero)) * torch.pow(
-            torch.sin(hidden_states * alpha), 2
-        )
-
-        return hidden_states
-
-
 class Qwen3TTSTokenizerV2DecoderDecoderResidualUnit(nn.Module):
     def __init__(self, dim: int = 16, dilation: int = 1):
         super().__init__()
@@ -848,6 +831,62 @@ class Qwen3TTSTokenizerV2Decoder(Qwen3TTSTokenizerV2DecoderPreTrainedModel):
 
         self.post_init()
 
+        # CUDA Graph support
+        self._cudagraph_enabled = False
+        self._cudagraph_wrapper = None
+
+    def precompute_snake_caches(self):
+        """Precompute exp(alpha) and 1/(exp(beta)+eps) for all SnakeBeta modules."""
+        count = 0
+        for module in self.modules():
+            if isinstance(module, SnakeBeta):
+                module.precompute_exp_cache()
+                count += 1
+        if count > 0:
+            logger.info("Precomputed exp caches for %d SnakeBeta activations", count)
+
+    def enable_cudagraph(
+        self,
+        capture_sizes: list[int] | None = None,
+        device: torch.device | None = None,
+        codec_chunk_frames: int = 0,
+        codec_left_context_frames: int = 0,
+        decode_chunk_size: int = 300,
+        decode_left_context: int = 25,
+    ):
+        from ..cuda_graph_decoder_wrapper import CUDAGraphDecoderWrapper
+
+        if device is None:
+            device = next(self.parameters()).device
+        if device.type != "cuda":
+            logger.warning("Cannot enable CUDA Graph: decoder is not on a CUDA device (got %s)", device)
+            return
+
+        self._cudagraph_wrapper = CUDAGraphDecoderWrapper(
+            decoder=self,
+            capture_sizes=capture_sizes,
+            num_quantizers=self.config.num_quantizers,
+            enabled=True,
+        )
+        self._cudagraph_wrapper.warmup(
+            device,
+            dtype=torch.long,
+            codec_chunk_frames=codec_chunk_frames,
+            codec_left_context_frames=codec_left_context_frames,
+            decode_chunk_size=decode_chunk_size,
+            decode_left_context=decode_left_context,
+        )
+        self._cudagraph_enabled = True
+        logger.info(
+            "CUDA Graph enabled for decoder: seq_lens=%s",
+            self._cudagraph_wrapper.capture_sizes,
+        )
+
+    def disable_cudagraph(self):
+        self._cudagraph_enabled = False
+        self._cudagraph_wrapper = None
+        logger.info("CUDA Graph disabled for decoder")
+
     def forward(self, codes):
         if codes.shape[1] != self.config.num_quantizers:
             raise ValueError(f"Expected {self.config.num_quantizers} layer of codes, got {codes.shape[1]}")
@@ -866,6 +905,11 @@ class Qwen3TTSTokenizerV2Decoder(Qwen3TTSTokenizerV2DecoderPreTrainedModel):
         return wav.clamp(min=-1, max=1)
 
     def chunked_decode(self, codes, chunk_size=300, left_context_size=25):
+        # Use CUDA graph if enabled
+        if self._cudagraph_enabled and self._cudagraph_wrapper is not None:
+            return self._cudagraph_wrapper.chunked_decode_with_cudagraph(codes, chunk_size, left_context_size)
+
+        # Original implementation (eager mode)
         wavs = []
         start_index = 0
         while start_index < codes.shape[-1]:
@@ -991,10 +1035,11 @@ class Qwen3TTSTokenizerV2Model(Qwen3TTSTokenizerV2PreTrainedModel):
 
         """
         return_dict = return_dict if return_dict is not None else self.config.return_dict
+        audio_lengths = (audio_codes[..., 0] > -1).sum(1) * self.decode_upsample_rate
 
+        audio_codes = torch.clamp(audio_codes, min=0)
         audio_values = self.decoder.chunked_decode(audio_codes.transpose(1, 2)).squeeze(1)
 
-        audio_lengths = (audio_codes[..., 0] > 0).sum(1) * self.decode_upsample_rate
         audio_values = [a[:length] for a, length in zip(audio_values, audio_lengths)]
 
         if not return_dict:
